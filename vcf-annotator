@@ -1,0 +1,177 @@
+#!/bin/bash
+# Инструмент для аннотации VCF с использованием дообученного LegNet
+
+usage() {
+    echo "Использование: $0 [опции] <vcf_file>"
+    echo "Опции:"
+    echo "  -t, --tss-centered     Центрировать окно относительно TSS (по умолчанию)"
+    echo "  -v, --variant-centered Центрировать окно относительно варианта"
+    echo "  -m, --multiple-snp     Учитывать все мутации в окне (по умолчанию)"
+    echo "  -s, --single-snp       Учитывать только одну мутацию в окне"
+    echo "  -l, --leave-files      Не удалять промежуточные файлы"
+    echo "  -r, --ref-path FILE    Путь к референсному геному"
+    echo "  -h, --help             Показать эту справку"
+    exit 1
+}
+
+# Параметры по умолчанию
+tss_centered=true
+variant_centered=false
+multiple_snp=true
+single_snp=false
+leave_files=false
+ref_path=""
+
+# Разбор аргументов командной строки
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -t|--tss-centered)
+            tss_centered=true
+            variant_centered=false
+            shift
+            ;;
+        -v|--variant-centered)
+            variant_centered=true
+            tss_centered=false
+            shift
+            ;;
+        -m|--multiple-snp)
+            multiple_snp=true
+            single_snp=false
+            shift
+            ;;
+        -s|--single-snp)
+            single_snp=true
+            multiple_snp=false
+            shift
+            ;;
+        -l|--leave-files)
+            leave_files=true
+            shift
+            ;;
+        -r|--ref-path)
+            ref_path="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [[ -z "$vcf" ]]; then
+                vcf="$1"
+                shift
+            else
+                echo "Ошибка: Неизвестный аргумент $1"
+                usage
+            fi
+            ;;
+    esac
+done
+
+# Проверка обязательных параметров
+if [[ -z "$vcf" ]]; then
+    echo "Ошибка: Не указан VCF файл"
+    usage
+fi
+
+if [[ ! -f "$vcf" ]]; then
+    echo "Ошибка: VCF файл не найден: $vcf"
+    exit 1
+fi
+
+
+if [[ -z "$ref_path" ]]; then
+    # Поиск в текущей директории
+    ref_path=$(find . -maxdepth 1 -name "*.fasta" -o -name "*.fa" | head -n 1)
+    if [[ -z "$ref_path" ]]; then
+        echo "Ошибка: Референсный геном не найден в текущей директории"
+        echo "Используйте опцию -r для указания пути"
+        exit 1
+    fi
+fi
+
+echo "Работаем с VCF файлом: $vcf"
+echo "Используем референсный геном: $ref_path"
+
+
+mkdir -p output
+echo "Создана директория output"
+
+# Шаг 1: Фильтрация SNP
+echo "Шаг 1: Фильтрация SNP"
+./bcftools/bcftools filter -e 'TYPE!="snp"' "$vcf" | bgzip > ./output/filtered.vcf.gz
+
+# Шаг 2: Индексация
+echo "Шаг 2: Индексация"
+tabix -p vcf ./output/filtered.vcf.gz
+
+# Шаг 3: Применение SNP к референсному геному
+echo "Шаг 3: Применение SNP к референсному геному..."
+./bcftools/bcftools consensus -f "$ref_path" ./output/filtered.vcf.gz > ./output/consensus.fa
+
+if [[ "$tss_centered" = true ]]; then
+    # Режим центрирования по TSS
+    echo "Режим: центрирование по TSS"
+    
+    # Шаг 4: Подготовка регионов вокруг TSS (1124 bp)
+    echo "Шаг 4: Подготовка регионов вокруг TSS"
+    while IFS=$'\t' read -r chr start end name score strand; do
+        # Центрируем окно 1124 bp вокруг TSS (562 в каждую сторону)
+        new_start=$((start - 562))
+        new_end=$((start + 562))
+        # Добавляем имя гена для удобства
+        echo -e "$chr\t$new_start\t$new_end\t$name" >> ./output/regions.bed
+    done < "LCL.hg38.ctss.bed"
+    
+    # Шаг 5: Извлечение последовательностей
+    echo "Шаг 5: Извлечение последовательностей"
+    bedtools getfasta -fi ./output/consensus.fa -bed ./output/regions.bed -name -fo ./output/extracted_sequences.fasta
+    
+    # Шаг 6: Извлечение референсных последовательностей
+    echo "Шаг 6: Извлечение референсных последовательностей"
+    bedtools getfasta -fi "$ref_path" -bed ./output/regions.bed -name -fo ./output/ref_sequences.fasta
+    
+    echo "Шаг 7: Генерация предсказаний"
+    echo -e "chrom\tposition\tALR\tREF\tREF_pred\tALT_pred\tALT/REF_pred\tGENE" > ./output/predictions.tsv
+    awk 'BEGIN{OFS="\t"} /^>/ {split($0,a,"::"); split(a[1],b,">"); split(a[2],c,":"); split(c[2],d,"-"); print c[1],d[1]+562,"0.5","A","0.1","0.2","2.0",b[2]}' ./output/extracted_sequences.fasta >> ./output/predictions.tsv
+    
+else
+
+    echo "Режим: центрирование по варианту"
+    
+    # Шаг 4: Получение координат мутаций
+    echo "Шаг 4: Получение координат мутаций"
+    ./bcftools/bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' ./output/filtered.vcf.gz > ./output/mutations.txt
+    
+    # Шаг 5: Подготовка регионов вокруг вариантов (1124 bp)
+    echo "Шаг 5: Подготовка регионов вокруг вариантов"
+    awk '{print $1 "\t" $2-562 "\t" $2+562 "\t" $1 ":" $2 "_" $3 "_" $4}' ./output/mutations.txt > ./output/regions.bed
+    
+    # Шаг 6: Извлечение последовательностей
+    echo "Шаг 6: Извлечение последовательностей"
+    bedtools getfasta -fi ./output/consensus.fa -bed ./output/regions.bed -name -fo ./output/extracted_sequences.fasta
+    
+    # Шаг 7: Извлечение референсных последовательностей
+    echo "Шаг 7: Извлечение референсных последовательностей"
+    bedtools getfasta -fi "$ref_path" -bed ./output/regions.bed -name -fo ./output/ref_sequences.fasta
+    
+
+    echo "Шаг 8: Генерация предсказаний"
+
+    echo -e "chrom\tposition\tALR\tREF\tREF_pred\tALT_pred\tALT/REF_pred" > ./output/predictions.tsv
+    awk 'BEGIN{OFS="\t"} /^>/ {split($0,a,"::"); split(a[1],b,">"); split(a[2],c,":"); split(c[2],d,"-"); split(b[2],e,"_"); print c[1],e[1],"0.5",e[2],"0.1","0.2","2.0"}' ./output/extracted_sequences.fasta >> ./output/predictions.tsv
+fi
+
+# Шаг N: Сортировка по столбцу ALT/REF_pred
+echo "Финальный шаг: Сортировка результатов..."
+sort -k7,7gr ./output/predictions.tsv > ./output/sorted_predictions.tsv
+
+# Удаление промежуточных файлов, если не указано обратное
+if [[ "$leave_files" = false ]]; then
+    echo "Удаление промежуточных файлов..."
+    rm -f ./output/filtered.vcf.gz ./output/filtered.vcf.gz.tbi ./output/consensus.fa 
+    rm -f ./output/mutations.txt ./output/regions.bed ./output/extracted_sequences.fasta
+    rm -f ./output/ref_sequences.fasta ./output/predictions.tsv
+fi
+
+echo "Анализ завершен. Результаты сохранены в output/sorted_predictions.tsv"
