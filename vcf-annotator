@@ -14,7 +14,7 @@ usage() {
     exit 1
 }
 
-# Параметры по умолчанию
+
 tss_centered=true
 variant_centered=false
 multiple_snp=true
@@ -68,7 +68,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Проверка обязательных параметров
+
+
 if [[ -z "$vcf" ]]; then
     echo "Ошибка: Не указан VCF файл"
     usage
@@ -78,7 +79,6 @@ if [[ ! -f "$vcf" ]]; then
     echo "Ошибка: VCF файл не найден: $vcf"
     exit 1
 fi
-
 
 if [[ -z "$ref_path" ]]; then
     # Поиск в текущей директории
@@ -93,41 +93,40 @@ fi
 echo "Работаем с VCF файлом: $vcf"
 echo "Используем референсный геном: $ref_path"
 
-
 mkdir -p output
 echo "Создана директория output"
 
-# Шаг 1: Фильтрация SNP
+
+
+
+
 echo "Шаг 1: Фильтрация SNP"
 ./bcftools/bcftools filter -e 'TYPE!="snp"' "$vcf" | bgzip > ./output/filtered.vcf.gz
 
-# Шаг 2: Индексация
+
 echo "Шаг 2: Индексация"
 tabix -p vcf ./output/filtered.vcf.gz
 
-# Шаг 3: Применение SNP к референсному геному
 echo "Шаг 3: Применение SNP к референсному геному..."
 ./bcftools/bcftools consensus -f "$ref_path" ./output/filtered.vcf.gz > ./output/consensus.fa
 
 if [[ "$tss_centered" = true ]]; then
-    # Режим центрирования по TSS
     echo "Режим: центрирование по TSS"
     
-    # Шаг 4: Подготовка регионов вокруг TSS (1124 bp)
     echo "Шаг 4: Подготовка регионов вокруг TSS"
     while IFS=$'\t' read -r chr start end name score strand; do
         # Центрируем окно 1124 bp вокруг TSS (562 в каждую сторону)
         new_start=$((start - 562))
         new_end=$((start + 562))
-        # Добавляем имя гена для удобства
+        # Добавляем имя гена 
         echo -e "$chr\t$new_start\t$new_end\t$name" >> ./output/regions.bed
     done < "LCL.hg38.ctss.bed"
     
-    # Шаг 5: Извлечение последовательностей
+
     echo "Шаг 5: Извлечение последовательностей"
     bedtools getfasta -fi ./output/consensus.fa -bed ./output/regions.bed -name -fo ./output/extracted_sequences.fasta
     
-    # Шаг 6: Извлечение референсных последовательностей
+
     echo "Шаг 6: Извлечение референсных последовательностей"
     bedtools getfasta -fi "$ref_path" -bed ./output/regions.bed -name -fo ./output/ref_sequences.fasta
     
@@ -139,34 +138,26 @@ else
 
     echo "Режим: центрирование по варианту"
     
-    # Шаг 4: Получение координат мутаций
     echo "Шаг 4: Получение координат мутаций"
     ./bcftools/bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' ./output/filtered.vcf.gz > ./output/mutations.txt
     
-    # Шаг 5: Подготовка регионов вокруг вариантов (1124 bp)
     echo "Шаг 5: Подготовка регионов вокруг вариантов"
     awk '{print $1 "\t" $2-562 "\t" $2+562 "\t" $1 ":" $2 "_" $3 "_" $4}' ./output/mutations.txt > ./output/regions.bed
     
-    # Шаг 6: Извлечение последовательностей
     echo "Шаг 6: Извлечение последовательностей"
     bedtools getfasta -fi ./output/consensus.fa -bed ./output/regions.bed -name -fo ./output/extracted_sequences.fasta
     
-    # Шаг 7: Извлечение референсных последовательностей
     echo "Шаг 7: Извлечение референсных последовательностей"
     bedtools getfasta -fi "$ref_path" -bed ./output/regions.bed -name -fo ./output/ref_sequences.fasta
     
-
     echo "Шаг 8: Генерация предсказаний"
-
     echo -e "chrom\tposition\tALR\tREF\tREF_pred\tALT_pred\tALT/REF_pred" > ./output/predictions.tsv
     awk 'BEGIN{OFS="\t"} /^>/ {split($0,a,"::"); split(a[1],b,">"); split(a[2],c,":"); split(c[2],d,"-"); split(b[2],e,"_"); print c[1],e[1],"0.5",e[2],"0.1","0.2","2.0"}' ./output/extracted_sequences.fasta >> ./output/predictions.tsv
 fi
 
-# Шаг N: Сортировка по столбцу ALT/REF_pred
-echo "Финальный шаг: Сортировка результатов..."
+echo "Финальный шаг: Сортировка результатов"
 sort -k7,7gr ./output/predictions.tsv > ./output/sorted_predictions.tsv
 
-# Удаление промежуточных файлов, если не указано обратное
 if [[ "$leave_files" = false ]]; then
     echo "Удаление промежуточных файлов..."
     rm -f ./output/filtered.vcf.gz ./output/filtered.vcf.gz.tbi ./output/consensus.fa 
