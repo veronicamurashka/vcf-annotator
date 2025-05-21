@@ -1,0 +1,304 @@
+#!/bin/bash
+# Инструмент для аннотации VCF с использованием дообученного LegNet
+
+usage() {
+    echo "Использование: $0 [опции] <vcf_file>"
+    echo "Опции:"
+    echo "  -t, --tss-centered     Центрировать окно относительно TSS (по умолчанию)"
+    echo "  -v, --variant-centered Центрировать окно относительно варианта"
+    echo "  -m, --multiple-snp     Учитывать все мутации в окне (по умолчанию)"
+    echo "  -s, --single-snp       Учитывать только одну мутацию в окне"
+    echo "  -l, --leave-files      Не удалять промежуточные файлы"
+    echo "  -r, --ref-path FILE    Путь к референсному геному"
+    echo "  --model-path PATH      Путь к директории с моделями LegNet"
+    echo "  -h, --help             Показать эту справку"
+    exit 1
+}
+
+# Параметры по умолчанию
+tss_centered=true
+variant_centered=false
+multiple_snp=true
+single_snp=false
+leave_files=false
+ref_path=""
+model_path="../LegnetCheckpoint_all_folds11"
+
+# Разбор аргументов командной строки
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -t|--tss-centered)
+            tss_centered=true
+            variant_centered=false
+            shift
+            ;;
+        -v|--variant-centered)
+            variant_centered=true
+            tss_centered=false
+            shift
+            ;;
+        -m|--multiple-snp)
+            multiple_snp=true
+            single_snp=false
+            shift
+            ;;
+        -s|--single-snp)
+            single_snp=true
+            multiple_snp=false
+            shift
+            ;;
+        -l|--leave-files)
+            leave_files=true
+            shift
+            ;;
+        -r|--ref-path)
+            ref_path="$2"
+            shift 2
+            ;;
+        --model-path)
+            model_path="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [[ -z "$vcf" ]]; then
+                vcf="$1"
+                shift
+            else
+                echo "Ошибка: Неизвестный аргумент $1"
+                usage
+            fi
+            ;;
+    esac
+done
+
+# Проверка обязательных параметров
+if [[ -z "$vcf" ]]; then
+    echo "Ошибка: Не указан VCF файл"
+    usage
+fi
+
+# Проверка существования VCF файла
+if [[ ! -f "$vcf" ]]; then
+    echo "Ошибка: VCF файл не найден: $vcf"
+    exit 1
+fi
+
+# Поиск референсного генома
+if [[ -z "$ref_path" ]]; then
+    # Поиск в текущей директории
+    ref_path=$(find . -maxdepth 1 -name "*.fasta" -o -name "*.fa" | head -n 1)
+    if [[ -z "$ref_path" ]]; then
+        echo "Ошибка: Референсный геном не найден в текущей директории"
+        echo "Используйте опцию -r для указания пути"
+        exit 1
+    fi
+fi
+
+echo "Работаем с VCF файлом: $vcf"
+echo "Используем референсный геном: $ref_path"
+echo "Путь к моделям: $model_path"
+
+# Создаем рабочую директорию
+mkdir -p output
+echo "Создана директория output"
+
+# Шаг 1: Фильтрация SNP
+echo "Шаг 1: Фильтрация SNP..."
+./bcftools/bcftools filter -e 'TYPE!="snp"' "$vcf" | bgzip > ./output/filtered.vcf.gz
+
+# Шаг 2: Индексация
+echo "Шаг 2: Индексация..."
+tabix -p vcf ./output/filtered.vcf.gz
+
+# Шаг 3: Применение SNP к референсному геному
+echo "Шаг 3: Применение SNP к референсному геному..."
+./bcftools/bcftools consensus -f "$ref_path" ./output/filtered.vcf.gz > ./output/consensus.fa
+
+if [[ "$tss_centered" = true ]]; then
+    # Режим центрирования по TSS
+    echo "Режим: центрирование по TSS"
+    
+    # Шаг 4: Подготовка регионов вокруг TSS (1124 bp)
+    echo "Шаг 4: Подготовка регионов вокруг TSS..."
+    while IFS=$'\t' read -r chr start end name score strand; do
+        # Центрируем окно 1124 bp вокруг TSS (562 в каждую сторону)
+        new_start=$((start - 562))
+        new_end=$((start + 562))
+        # Добавляем имя гена для удобства
+        echo -e "$chr\t$new_start\t$new_end\t$name" >> ./output/regions.bed
+    done < "LCL.hg38.ctss.bed"
+    
+    # Шаг 5: Извлечение последовательностей
+    echo "Шаг 5: Извлечение последовательностей..."
+    bedtools getfasta -fi ./output/consensus.fa -bed ./output/regions.bed -name -fo ./output/extracted_sequences.fasta
+    
+    # Шаг 6: Извлечение референсных последовательностей
+    echo "Шаг 6: Извлечение референсных последовательностей..."
+    bedtools getfasta -fi "$ref_path" -bed ./output/regions.bed -name -fo ./output/ref_sequences.fasta
+    
+    # Шаг 7: Генерация предсказаний для альтернативных последовательностей
+    echo "Шаг 7: Генерация предсказаний для альтернативных последовательностей..."
+    python3 new_fasta_predict.py \
+        --config no \
+        --model \
+            "$model_path/model_2_1/lightning_logs/version_0/checkpoints/pearson-epoch=06-val_pearson=0.55.ckpt" \
+            "$model_path/model_3_1/lightning_logs/version_0/checkpoints/pearson-epoch=05-val_pearson=0.67.ckpt" \
+            "$model_path/model_4_1/lightning_logs/version_0/checkpoints/pearson-epoch=19-val_pearson=0.65.ckpt" \
+            "$model_path/model_5_1/lightning_logs/version_0/checkpoints/pearson-epoch=01-val_pearson=0.58.ckpt" \
+            "$model_path/model_6_1/lightning_logs/version_0/checkpoints/pearson-epoch=12-val_pearson=0.59.ckpt" \
+            "$model_path/model_7_1/lightning_logs/version_0/checkpoints/pearson-epoch=07-val_pearson=0.57.ckpt" \
+            "$model_path/model_8_1/lightning_logs/version_0/checkpoints/pearson-epoch=15-val_pearson=0.53.ckpt" \
+            "$model_path/model_9_1/lightning_logs/version_0/checkpoints/pearson-epoch=26-val_pearson=0.47.ckpt" \
+            "$model_path/model_10_1/lightning_logs/version_0/checkpoints/last_model-epoch=23.ckpt" \
+        --fasta ./output/extracted_sequences.fasta \
+        --out_path ./output/alt_predictions.csv \
+        --device 1
+    
+    # Шаг 8: Генерация предсказаний для референсных последовательностей
+    echo "Шаг 8: Генерация предсказаний для референсных последовательностей..."
+    python3 new_fasta_predict.py \
+        --config no \
+        --model \
+            "$model_path/model_2_1/lightning_logs/version_0/checkpoints/pearson-epoch=06-val_pearson=0.55.ckpt" \
+            "$model_path/model_3_1/lightning_logs/version_0/checkpoints/pearson-epoch=05-val_pearson=0.67.ckpt" \
+            "$model_path/model_4_1/lightning_logs/version_0/checkpoints/pearson-epoch=19-val_pearson=0.65.ckpt" \
+            "$model_path/model_5_1/lightning_logs/version_0/checkpoints/pearson-epoch=01-val_pearson=0.58.ckpt" \
+            "$model_path/model_6_1/lightning_logs/version_0/checkpoints/pearson-epoch=12-val_pearson=0.59.ckpt" \
+            "$model_path/model_7_1/lightning_logs/version_0/checkpoints/pearson-epoch=07-val_pearson=0.57.ckpt" \
+            "$model_path/model_8_1/lightning_logs/version_0/checkpoints/pearson-epoch=15-val_pearson=0.53.ckpt" \
+            "$model_path/model_9_1/lightning_logs/version_0/checkpoints/pearson-epoch=26-val_pearson=0.47.ckpt" \
+            "$model_path/model_10_1/lightning_logs/version_0/checkpoints/last_model-epoch=23.ckpt" \
+        --fasta ./output/ref_sequences.fasta \
+        --out_path ./output/ref_predictions.csv \
+        --device 1
+    
+    # Шаг 9: Объединение результатов
+    echo "Шаг 9: Объединение результатов..."
+    echo -e "chrom\tposition\tALR\tREF\tREF_pred\tALT_pred\tALT/REF_pred\tGENE" > ./output/predictions.tsv
+    
+    # Обработка результатов для TSS-центрированного режима
+    paste -d, ./output/ref_predictions.csv ./output/alt_predictions.csv | awk -F, '
+    BEGIN {OFS="\t"}
+    NR > 1 {
+        split($1, ref_info, "_");
+        split($2, alt_info, "_");
+        chrom_pos = ref_info[1];
+        split(chrom_pos, cp, ":");
+        chrom = cp[1];
+        pos = cp[2];
+        ref_pred = $3;
+        alt_pred = $6;
+        ratio = (ref_pred == 0) ? "inf" : alt_pred/ref_pred;
+        
+        # Извлекаем имя гена из ID последовательности
+        gene = ref_info[2];
+        for (i=3; i<=length(ref_info); i++) {
+            gene = gene "_" ref_info[i];
+        }
+        sub(/\..*/, "", gene);
+        
+        # Здесь можно добавить реальные значения ALR и REF из VCF
+        print chrom, pos+562, "0.5", "N", ref_pred, alt_pred, ratio, gene
+    }' >> ./output/predictions.tsv
+    
+else
+    # Режим центрирования по варианту
+    echo "Режим: центрирование по варианту"
+    
+    # Шаг 4: Получение координат мутаций
+    echo "Шаг 4: Получение координат мутаций..."
+    ./bcftools/bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' ./output/filtered.vcf.gz > ./output/mutations.txt
+    
+    # Шаг 5: Подготовка регионов вокруг вариантов (1124 bp)
+    echo "Шаг 5: Подготовка регионов вокруг вариантов..."
+    awk '{print $1 "\t" $2-562 "\t" $2+562 "\t" $1 ":" $2 "_" $3 "_" $4}' ./output/mutations.txt > ./output/regions.bed
+    
+    # Шаг 6: Извлечение последовательностей
+    echo "Шаг 6: Извлечение последовательностей..."
+    bedtools getfasta -fi ./output/consensus.fa -bed ./output/regions.bed -name -fo ./output/extracted_sequences.fasta
+    
+    # Шаг 7: Извлечение референсных последовательностей
+    echo "Шаг 7: Извлечение референсных последовательностей..."
+    bedtools getfasta -fi "$ref_path" -bed ./output/regions.bed -name -fo ./output/ref_sequences.fasta
+    
+    # Шаг 8: Генерация предсказаний для альтернативных последовательностей
+    echo "Шаг 8: Генерация предсказаний для альтернативных последовательностей..."
+    python3 new_fasta_predict.py \
+        --config no \
+        --model \
+            "$model_path/model_2_1/lightning_logs/version_0/checkpoints/pearson-epoch=06-val_pearson=0.55.ckpt" \
+            "$model_path/model_3_1/lightning_logs/version_0/checkpoints/pearson-epoch=05-val_pearson=0.67.ckpt" \
+            "$model_path/model_4_1/lightning_logs/version_0/checkpoints/pearson-epoch=19-val_pearson=0.65.ckpt" \
+            "$model_path/model_5_1/lightning_logs/version_0/checkpoints/pearson-epoch=01-val_pearson=0.58.ckpt" \
+            "$model_path/model_6_1/lightning_logs/version_0/checkpoints/pearson-epoch=12-val_pearson=0.59.ckpt" \
+            "$model_path/model_7_1/lightning_logs/version_0/checkpoints/pearson-epoch=07-val_pearson=0.57.ckpt" \
+            "$model_path/model_8_1/lightning_logs/version_0/checkpoints/pearson-epoch=15-val_pearson=0.53.ckpt" \
+            "$model_path/model_9_1/lightning_logs/version_0/checkpoints/pearson-epoch=26-val_pearson=0.47.ckpt" \
+            "$model_path/model_10_1/lightning_logs/version_0/checkpoints/last_model-epoch=23.ckpt" \
+        --fasta ./output/extracted_sequences.fasta \
+        --out_path ./output/alt_predictions.csv \
+        --device 1
+    
+    # Шаг 9: Генерация предсказаний для референсных последовательностей
+    echo "Шаг 9: Генерация предсказаний для референсных последовательностей..."
+    python3 new_fasta_predict.py \
+        --config no \
+        --model \
+            "$model_path/model_2_1/lightning_logs/version_0/checkpoints/pearson-epoch=06-val_pearson=0.55.ckpt" \
+            "$model_path/model_3_1/lightning_logs/version_0/checkpoints/pearson-epoch=05-val_pearson=0.67.ckpt" \
+            "$model_path/model_4_1/lightning_logs/version_0/checkpoints/pearson-epoch=19-val_pearson=0.65.ckpt" \
+            "$model_path/model_5_1/lightning_logs/version_0/checkpoints/pearson-epoch=01-val_pearson=0.58.ckpt" \
+            "$model_path/model_6_1/lightning_logs/version_0/checkpoints/pearson-epoch=12-val_pearson=0.59.ckpt" \
+            "$model_path/model_7_1/lightning_logs/version_0/checkpoints/pearson-epoch=07-val_pearson=0.57.ckpt" \
+            "$model_path/model_8_1/lightning_logs/version_0/checkpoints/pearson-epoch=15-val_pearson=0.53.ckpt" \
+            "$model_path/model_9_1/lightning_logs/version_0/checkpoints/pearson-epoch=26-val_pearson=0.47.ckpt" \
+            "$model_path/model_10_1/lightning_logs/version_0/checkpoints/last_model-epoch=23.ckpt" \
+        --fasta ./output/ref_sequences.fasta \
+        --out_path ./output/ref_predictions.csv \
+        --device 1
+    
+    # Шаг 10: Объединение результатов
+    echo "Шаг 10: Объединение результатов..."
+    echo -e "chrom\tposition\tALR\tREF\tREF_pred\tALT_pred\tALT/REF_pred" > ./output/predictions.tsv
+    
+    # Обработка результатов для варианто-центрированного режима
+    paste -d, ./output/ref_predictions.csv ./output/alt_predictions.csv | awk -F, '
+    BEGIN {OFS="\t"}
+    NR > 1 {
+        split($1, ref_info, "_");
+        split($2, alt_info, "_");
+        chrom_pos = ref_info[1];
+        split(chrom_pos, cp, ":");
+        chrom = cp[1];
+        pos = cp[2];
+        ref_pred = $3;
+        alt_pred = $6;
+        ratio = (ref_pred == 0) ? "inf" : alt_pred/ref_pred;
+        
+        # Извлекаем REF и ALT из ID последовательности
+        split(ref_info[2], mut, "_");
+        ref = mut[1];
+        alt = mut[2];
+        
+        # Здесь можно добавить реальные значения ALR из VCF
+        print chrom, pos, "0.5", ref, ref_pred, alt_pred, ratio
+    }' >> ./output/predictions.tsv
+fi
+
+# Шаг N: Сортировка по столбцу ALT/REF_pred
+echo "Финальный шаг: Сортировка результатов..."
+sort -k7,7gr ./output/predictions.tsv > ./output/sorted_predictions.tsv
+
+# Удаление промежуточных файлов, если не указано обратное
+if [[ "$leave_files" = false ]]; then
+    echo "Удаление промежуточных файлов..."
+    rm -f ./output/filtered.vcf.gz ./output/filtered.vcf.gz.tbi ./output/consensus.fa 
+    rm -f ./output/mutations.txt ./output/regions.bed ./output/extracted_sequences.fasta
+    rm -f ./output/ref_sequences.fasta ./output/ref_predictions.csv ./output/alt_predictions.csv
+    rm -f ./output/predictions.tsv
+fi
+
+echo "Анализ завершен. Результаты сохранены в output/sorted_predictions.tsv"
